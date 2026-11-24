@@ -1,8 +1,10 @@
-from flask import Flask, request, render_template_string, redirect, url_for, flash, send_from_directory
+from flask import Flask, request, render_template_string, redirect, url_for, flash, send_from_directory, Response
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
 import os
+import json
+import tempfile
 import pymupdf
 import re
 import time
@@ -10,24 +12,43 @@ import csv
 import threading
 from werkzeug.utils import secure_filename
 
+ON_VERCEL = bool(os.environ.get("VERCEL") or os.environ.get("VERCEL_ENV"))
 app = Flask(__name__)
-app.secret_key = "super_secret_key_para_flash"
-UPLOAD_FOLDER = 'uploads'
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "super_secret_key_para_flash")
+UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER") or (
+    os.path.join(tempfile.gettempdir(), "catalogos_uploads") if ON_VERCEL else "uploads"
+)
 ALLOWED_EXTENSIONS = {'pdf'}
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
-if not os.path.exists('static'):
-    os.makedirs('static')
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD")
+
+@app.before_request
+def verificar_acceso():
+    if not ADMIN_PASSWORD:
+        return None
+    auth = request.authorization
+    if auth and auth.username == ADMIN_USER and auth.password == ADMIN_PASSWORD:
+        return None
+    return Response("Acceso restringido", 401, {
+        "WWW-Authenticate": 'Basic realm="Generador de catálogos"'
+    })
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name('credenciales.json', scope)
+credenciales_json = os.environ.get("GOOGLE_CREDENTIALS")
+if credenciales_json:
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(credenciales_json), scope)
+else:
+    creds = ServiceAccountCredentials.from_json_keyfile_name('credenciales.json', scope)
 client = gspread.authorize(creds)
-SHEET_ID = "1fAZr-4AUmAW2RcMwOpquA85Mb50lpAHY-XQFa5G015g"
+SHEET_ID = os.environ.get("SHEET_ID", "1fAZr-4AUmAW2RcMwOpquA85Mb50lpAHY-XQFa5G015g")
 
 def leer_hoja_a_df(nombre_hoja):
     sheet = client.open_by_key(SHEET_ID)
@@ -120,6 +141,22 @@ def extraer_piezas_pagina(texto_pagina):
         i += 1
     return piezas
 
+def importar_filas(filas, esperar=False):
+    hoja = client.open_by_key(SHEET_ID).worksheet("Catalogo_Original")
+    insertadas = 0
+    fallidas = []
+    for i in range(0, len(filas), 20):
+        lote = filas[i:i+20]
+        try:
+            hoja.append_rows(lote, value_input_option='USER_ENTERED')
+            insertadas += len(lote)
+        except Exception as e:
+            print(f"[RETRY] Error en lote: {e}")
+            fallidas.extend(lote)
+        if esperar:
+            time.sleep(2)
+    return insertadas, fallidas
+
 def importar_pendientes_background(ruta_csv):
     print(f"[BACKGROUND] Iniciando importación de {ruta_csv}...")
     try:
@@ -127,15 +164,8 @@ def importar_pendientes_background(ruta_csv):
             reader = csv.reader(f)
             next(reader)
             filas = list(reader)
-        hoja = client.open_by_key(SHEET_ID).worksheet("Catalogo_Original")
-        insertadas = 0
-        for i in range(0, len(filas), 20):
-            lote = filas[i:i+20]
-            hoja.append_rows(lote, value_input_option='USER_ENTERED')
-            insertadas += len(lote)
-            print(f"[BACKGROUND] Lote insertado: {insertadas}/{len(filas)}")
-            time.sleep(2)
-        print(f"[BACKGROUND] Importación completada: {insertadas} piezas.")
+        insertadas, fallidas = importar_filas(filas, esperar=True)
+        print(f"[BACKGROUND] {insertadas} insertadas, {len(fallidas)} fallidas.")
     except Exception as e:
         print(f"[BACKGROUND] Error: {e}")
 
@@ -199,19 +229,22 @@ def procesar_pdf(filepath, filename):
             pendientes.extend(lote)
 
     if pendientes:
-        base = os.path.splitext(os.path.basename(filename))[0]
-        ruta_csv = os.path.join(UPLOAD_FOLDER, f"{base}_pendientes.csv")
-        with open(ruta_csv, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                'ID_Pieza', 'Codigo_Catalogo', 'Descripcion', 'Precio',
-                'Catalogo_PDF', 'Pagina', 'Coordenada_X', 'Coordenada_Y', 'Ancho', 'Alto'
-            ])
-            writer.writerows(pendientes)
-        hilo = threading.Thread(target=importar_pendientes_background, args=(ruta_csv,))
-        hilo.start()
-        return insertadas, len(pendientes)
-    return insertadas, 0
+        if ON_VERCEL:
+            guardadas, pendientes = importar_filas(pendientes)
+            insertadas += guardadas
+        else:
+            base = os.path.splitext(os.path.basename(filename))[0]
+            ruta_csv = os.path.join(UPLOAD_FOLDER, f"{base}_pendientes.csv")
+            with open(ruta_csv, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'ID_Pieza', 'Codigo_Catalogo', 'Descripcion', 'Precio',
+                    'Catalogo_PDF', 'Pagina', 'Coordenada_X', 'Coordenada_Y', 'Ancho', 'Alto'
+                ])
+                writer.writerows(pendientes)
+            hilo = threading.Thread(target=importar_pendientes_background, args=(ruta_csv,))
+            hilo.start()
+    return insertadas, len(pendientes)
 
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html lang="es">
@@ -309,7 +342,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
         <div class="right-panel">
             <div class="portada-container" id="portadaContainer">
-                <img src="{{ url_for('static', filename='portada.png') }}" class="portada-img" alt="Portada Catálogos Interactivos">
+                <img src="/portada.png" class="portada-img" alt="Portada Catálogos Interactivos">
             </div>
 
             <div class="pdf-title" id="pdfTitle">Catálogo Cargado</div>
@@ -322,6 +355,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
     <script>
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+        const ON_VERCEL = {{ 'true' if on_vercel else 'false' }};
 
         function abrirPdfDesdeElemento(elemento) {
             const archivo = elemento.getAttribute('data-archivo');
@@ -333,6 +367,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 
             if (!archivo || archivo === 'None' || archivo === '') {
                 alert("No se encontró el nombre del archivo PDF para esta pieza en la base de datos.");
+                return;
+            }
+
+            if (ON_VERCEL) {
+                alert('La vista previa de PDF no está disponible en Vercel (los archivos son temporales). Consulta el catálogo público para ver el PDF.');
                 return;
             }
 
@@ -389,7 +428,7 @@ def uploaded_file(filename):
 
 @app.route('/')
 def index():
-    return render_template_string(HTML_TEMPLATE, query='', resultados=[])
+    return render_template_string(HTML_TEMPLATE, query='', resultados=[], on_vercel=ON_VERCEL)
 
 @app.route('/buscar')
 def buscar():
@@ -399,7 +438,7 @@ def buscar():
     except Exception as e:
         flash(f'Error al buscar en Google Sheets: {str(e)}', 'error')
         resultados = []
-    return render_template_string(HTML_TEMPLATE, query=query, resultados=resultados)
+    return render_template_string(HTML_TEMPLATE, query=query, resultados=resultados, on_vercel=ON_VERCEL)
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -414,7 +453,10 @@ def upload_file():
     try:
         insertadas, pendientes = procesar_pdf(filepath, filename)
         if pendientes > 0:
-            flash(f'Se procesaron {insertadas} piezas. {pendientes} quedaron en cola y se están subiendo automáticamente en segundo plano.', 'info')
+            if ON_VERCEL:
+                flash(f'Se procesaron {insertadas} piezas. {pendientes} no se pudieron guardar por cuota de Google Sheets; vuelve a subir el PDF más tarde.', 'error')
+            else:
+                flash(f'Se procesaron {insertadas} piezas. {pendientes} quedaron en cola y se están subiendo automáticamente en segundo plano.', 'info')
         elif insertadas > 0:
             flash(f'Archivo "{filename}" procesado. Se agregaron {insertadas} piezas nuevas exitosamente.', 'success')
         else:
